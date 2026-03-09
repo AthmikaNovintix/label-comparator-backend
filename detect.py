@@ -101,7 +101,7 @@ def compare_labels(base_det, edited_det, threshold=40):
                 dist = math.dist(c1, c2)
                 if dist > threshold:
                     e = e.copy()
-                    e["label"] = "Misplaced"
+                    e["label"] = "Repositioned"
                     misplaced.append(e)
                     print(f"  [~] MISPLACED: {e['class']} (Shifted {int(dist)} pixels)")
                     

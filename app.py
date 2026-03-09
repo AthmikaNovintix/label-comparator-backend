@@ -226,7 +226,7 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=2):
         color_map = {
             "Added": (0,255,0), 
             "Removed": (255,0,0), 
-            "Misplaced": (255,165,0),  
+            "Repositioned": (255,165,0),  
             "Symbol": (0,0,255) 
         }
         
@@ -381,7 +381,7 @@ async def compare_labels(
                         if dist > 40: 
                             if region_has_symbol(comp_aligned, match["bbox"]):
                                 misplaced_box = match.copy()
-                                misplaced_box["label"] = "Misplaced"
+                                misplaced_box["label"] = "Repositioned"
                                 comp_symbols_final.append(misplaced_box)
                 else:
                     missing_box = base_sym.copy()
@@ -492,13 +492,13 @@ async def compare_labels(
 
             added_syms = [s["class"] for s in comp_symbols if s["label"] == "Added"]
             removed_syms = [s["class"] for s in comp_symbols if s["label"] == "Removed"]
-            misplaced_syms = [s["class"] for s in comp_symbols if s["label"] == "Misplaced"]
+            misplaced_syms = [s["class"] for s in comp_symbols if s["label"] == "Repositioned"]
             
             discrepancy_report = {
                 "Added": [],
                 "Deleted": [],
                 "Modified": [],
-                "Misplaced": []
+                "Repositioned": []
             }
             
             for item in added_text: discrepancy_report["Added"].append({"Category": "Text", "Value": item})
@@ -506,7 +506,7 @@ async def compare_labels(
             for item in modified_text: discrepancy_report["Modified"].append({"Category": "Text", "Value": item})
             
             for item in added_syms: discrepancy_report["Added"].append({"Category": "Symbol", "Value": item})
-            for item in misplaced_syms: discrepancy_report["Misplaced"].append({"Category": "Symbol", "Value": item})
+            for item in misplaced_syms: discrepancy_report["Repositioned"].append({"Category": "Symbol", "Value": item})
             for item in removed_syms: discrepancy_report["Deleted"].append({"Category": "Symbol", "Value": item})
             
             for item in added_bc: discrepancy_report["Added"].append({"Category": "Barcode", "Value": item})
@@ -545,8 +545,8 @@ async def compare_labels(
                         dist = math.dist(c1, c2)
                         if dist > 40: 
                             if region_has_symbol(comp_aligned, match["bbox"]):
-                                base_draw_actions.append((base_sym["bbox"], color_misplaced, "Misplaced", False))
-                                child_draw_actions.append((match["bbox"], color_misplaced, "Misplaced", False))
+                                base_draw_actions.append((base_sym["bbox"], color_misplaced, "Repositioned", False))
+                                child_draw_actions.append((match["bbox"], color_misplaced, "Repositioned", False))
                 else:
                     base_draw_actions.append((base_sym["bbox"], color_deleted, "Deleted", False))
 

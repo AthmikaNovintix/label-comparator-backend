@@ -175,7 +175,7 @@ def draw_symbol_boxes(image, detections, color_map=None, thickness=3):
         color_map = {
             "Added": (0,255,0),
             "Removed": (255,0,0),
-            "Misplaced": (255,255,0),
+            "Repositioned": (255,255,0),
             "Symbol": (0,0,255)
         }
     for d in detections:
@@ -351,7 +351,7 @@ def main():
                                 if dist > 40: 
                                     if region_has_symbol(comp_aligned, match["bbox"]):
                                         misplaced_box = match.copy()
-                                        misplaced_box["label"] = "Misplaced"
+                                        misplaced_box["label"] = "Repositioned"
                                         comp_symbols_final.append(misplaced_box)
                         else:
                             missing_box = base_sym.copy()
