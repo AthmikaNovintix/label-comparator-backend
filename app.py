@@ -578,11 +578,19 @@ async def compare_labels(
 
             def apply_draws(draw_obj, actions):
                 for bbox, color, label, is_xywh in actions:
-                    if is_xywh:
-                        x, y, w, h = map(int, bbox)
-                        x1, y1, x2, y2 = x, y, x+w, y+h
-                    else:
-                        x1, y1, x2, y2 = map(int, bbox)
+                    # Robust check: Must be a sequence of exactly 4 coordinates
+                    if not bbox or not hasattr(bbox, '__len__') or len(bbox) != 4:
+                        continue
+                        
+                    try:
+                        if is_xywh:
+                            x, y, w, h = map(int, bbox)
+                            x1, y1, x2, y2 = x, y, x+w, y+h
+                        else:
+                            x1, y1, x2, y2 = map(int, bbox)
+                    except (TypeError, ValueError):
+                        # Skip if there's any issue converting coordinates to integers
+                        continue
                     draw_obj.rectangle([x1, y1, x2, y2], outline=color, width=3)
                     # Add background for text to make it readable
                     text_bbox = draw_obj.textbbox((x1, max(0, y1-25)), label, font=font) if font else draw_obj.textbbox((x1, max(0, y1-15)), label)
