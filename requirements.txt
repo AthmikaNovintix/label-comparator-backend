@@ -3,7 +3,6 @@ uvicorn
 python-multipart
 Pillow
 opencv-python-headless
-opencv-python==0
 PyMuPDF
 numpy
 pandas
