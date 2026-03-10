@@ -45,8 +45,18 @@ def _zxing_decode(image):
             try_downscale=True
         )
         for res in zx_results:
-            # ZXing Python bindings return objects with .text and .format properties
-            found.append({"data": res.text, "type": res.format.name})
+            # ZXing position normally returns a 'position' object with corner points
+            try:
+                p = res.position
+                x1 = min(p.top_left.x, p.bottom_left.x)
+                y1 = min(p.top_left.y, p.top_right.y)
+                x2 = max(p.top_right.x, p.bottom_right.x)
+                y2 = max(p.bottom_left.y, p.bottom_right.y)
+                bbox = [int(x1), int(y1), int(x2), int(y2)]
+            except:
+                bbox = None
+                
+            found.append({"data": res.text, "type": res.format.name, "bbox": bbox})
     except Exception as e:
         print(f"Error in zxing decode: {e}")
     return found
@@ -64,52 +74,53 @@ def extract_barcodes(image):
     # 1. Standard Decode
     results.extend(_zxing_decode(img_np))
 
-    # 2. Channel-based Preprocessing
-    if len(results) < 2 and len(img_np.shape) == 3 and img_np.shape[2] == 3:
-        # Blue channel often neutralizes blue/light-blue watermarks
-        blue = img_np[:, :, 0]
-        results.extend(_zxing_decode(cv2.cvtColor(blue, cv2.COLOR_GRAY2BGR)))
+    # 2. Advanced Preprocessing Passes for tricky barcodes
+    if not any(r['type'] in ['Code128', 'Code39', 'EAN8', 'EAN13', 'UPCA'] for r in results):
+        gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
         
-        # Histogram Equalization
-        equ = cv2.equalizeHist(blue)
-        results.extend(_zxing_decode(cv2.cvtColor(equ, cv2.COLOR_GRAY2BGR)))
+        # 2a. Multi-scale
+        results.extend(_zxing_decode(cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)))
+        results.extend(_zxing_decode(cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)))
+        
+        # 2b. Otsu Thresholding
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        results.extend(_zxing_decode(cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)))
+        
+        # 2c. Morphological Closing (helps repair broken bars)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+        results.extend(_zxing_decode(cv2.cvtColor(closed, cv2.COLOR_GRAY2BGR)))
+        
+        # 2d. Horizontal Blur to connect bars vertically (good for 1D barcodes)
+        blurred = cv2.GaussianBlur(gray, (1, 15), 0)
+        _, thresh_blur = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        results.extend(_zxing_decode(cv2.cvtColor(thresh_blur, cv2.COLOR_GRAY2BGR)))
 
-    # 3. Agentic Scanline Averaging Pass (Fallback if Code128 is missing)
-    has_code128 = any(r['type'] == 'Code128' for r in results)
-    if not has_code128:
+        # 2e. Scanline Averaging for Multiple Patches (Top, Mid, Bottom)
         h, w = img_np.shape[:2]
+        patches = [
+            gray[0:int(h*0.3), :],                  # Top
+            gray[int(h*0.35):int(h*0.65), :],       # Middle
+            gray[int(h*0.7):h, :]                   # Bottom
+        ]
         
-        # ROI: Bottom 30% of the image
-        roi = img_np[int(h*0.7):h, :]
-        if len(roi.shape) == 3:
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = roi
-            
-        # Scanline Averaging: Average pixels vertically to eliminate noise/watermarks
-        avg_line = np.mean(gray, axis=0).astype(np.uint8)
-        
-        # Re-broadcast the 1D line back to 2D for zxing
-        scan_img = np.tile(avg_line, (200, 1))
-        
-        # Add quiet zone padding
-        padded = cv2.copyMakeBorder(scan_img, 100, 100, 100, 100, cv2.BORDER_CONSTANT, value=255)
-        processed = cv2.cvtColor(padded, cv2.COLOR_GRAY2BGR)
-        
-        # Upscale 2x for better resolution
-        h_p, w_p = processed.shape[:2]
-        processed = cv2.resize(processed, (w_p*2, h_p), interpolation=cv2.INTER_CUBIC)
-        
-        results.extend(_zxing_decode(processed))
+        for p in patches:
+            if p.shape[0] < 10: continue
+            avg_line = np.mean(p, axis=0).astype(np.uint8)
+            scan_img = np.tile(avg_line, (200, 1))
+            padded = cv2.copyMakeBorder(scan_img, 100, 100, 100, 100, cv2.BORDER_CONSTANT, value=255)
+            processed = cv2.cvtColor(padded, cv2.COLOR_GRAY2BGR)
+            processed = cv2.resize(processed, None, fx=2.0, fy=1.0, interpolation=cv2.INTER_CUBIC)
+            results.extend(_zxing_decode(processed))
 
-    # 4. De-duplicate results
+    # 4. De-duplicate results while preserving boxes
     unique_barcodes = []
     seen = set()
     for res in results:
         data = res['data']
         if data not in seen:
             seen.add(data)
-            unique_barcodes.append(data)
+            unique_barcodes.append({"data": data, "bbox": res.get("bbox")})
             
     return unique_barcodes
 
@@ -198,9 +209,10 @@ def extract_all_features(image, precomputed_symbols, logo_folder="logos"):
     features = []
 
     # 1. Advanced Barcode Extraction (Includes Agentic Scanner Logic)
-    barcodes = extract_barcodes(image)
-    for bc in barcodes:
-        features.append({"Type": "Barcode", "Value": bc, "Box": None})
+    barcodes_raw = extract_barcodes(image)
+    barcode_values = [b["data"] for b in barcodes_raw]
+    for bc in barcodes_raw:
+        features.append({"Type": "Barcode", "Value": bc["data"], "Box": bc["bbox"]})
 
     # 2. Logo / Image Extraction (Now powered by RANSAC)
     logos = detect_logos(image, logo_folder)
@@ -219,11 +231,52 @@ def extract_all_features(image, precomputed_symbols, logo_folder="logos"):
         gray = np_img
         
     gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    
+    # Get HOCR or data to have boxes for OCR-detected barcodes
+    ocr_data = pytesseract.image_to_data(gray, lang='eng+fra+deu', output_type=pytesseract.Output.DICT)
     ocr_text = pytesseract.image_to_string(gray, lang='eng+fra+deu')
     
+    # Convert barcodes to sets of stripped strings for robust duplicate checking
+    barcode_compact = [re.sub(r'\s+', '', bc).lower() for bc in barcode_values]
+    
     for line in ocr_text.split('\n'):
-        clean_text = re.sub(r'[|><_~=«»"]', '', line).strip()
-        if len(clean_text) > 2 and any(c.isalnum() for c in clean_text) and clean_text not in barcodes:
-            features.append({"Type": "Text", "Value": clean_text, "Box": None})
+        clean_text = re.sub(r'[|><_~=«»"*;]', '', line).strip()
+        compact_text = re.sub(r'\s+', '', clean_text).lower()
+        
+        if len(clean_text) > 2 and any(c.isalnum() for c in clean_text):
+            # Check if this text is basically an extracted barcode
+            is_barcode_already_found = any(compact_text in bc or bc in compact_text for bc in barcode_compact if len(bc) > 4)
+            
+            # Heuristic for undetected 1D barcodes that OCR picks up:
+            looks_like_raw_barcode = (
+                len(compact_text) > 10 and 
+                compact_text.isalnum() and
+                clean_text.isupper() and 
+                not any(c.islower() for c in clean_text) and
+                sum(c.isdigit() for c in clean_text) > 2
+            )
+
+            if is_barcode_already_found:
+                continue  # Skip, it's already a barcode feature
+            elif looks_like_raw_barcode:
+                # Find coarse box from OCR data for this text
+                bbox = None
+                try:
+                    # Search for the clean_text in ocr_data words
+                    # Tesseract data is word-by-word, so we look for matching strings
+                    for i, word in enumerate(ocr_data['text']):
+                        if compact_text in re.sub(r'\s+', '', word).lower():
+                            x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
+                            # Scale back down (we resized by 1.5x)
+                            bbox = [int(x/1.5), int(y/1.5), int((x+w)/1.5), int((y+h)/1.5)]
+                            break
+                except:
+                    pass
+                
+                barcode_values.append(clean_text)
+                barcode_compact.append(compact_text)
+                features.append({"Type": "Barcode", "Value": clean_text, "Box": bbox})
+            else:
+                features.append({"Type": "Text", "Value": clean_text, "Box": None})
 
     return pd.DataFrame(features)

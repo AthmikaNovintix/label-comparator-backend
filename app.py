@@ -166,6 +166,20 @@ def find_differences(imageA, imageB, threshold=0.85, min_area=150):
         grayA = cv2.cvtColor(np.array(imageA), cv2.COLOR_RGB2GRAY)
         grayB = cv2.cvtColor(np.array(imageB), cv2.COLOR_RGB2GRAY)
         score, diff = ssim(grayA, grayB, full=True)
+        
+        # --- ENTIRELY DIFFERENT DETECTION ---
+        # If similarity is very low, they are fundamentally different labels
+        is_entirely_different = score < 0.6
+        if is_entirely_different:
+            h, w = grayB.shape[:2]
+            return {
+                'ssim_score': score,
+                'bounding_boxes': [(0, 0, w, h)],
+                'total_differences': 1,
+                'is_entirely_different': True
+            }
+        # ------------------------------------
+        
         diff = (diff * 255).astype("uint8")
         thresh = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
         cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -178,7 +192,8 @@ def find_differences(imageA, imageB, threshold=0.85, min_area=150):
         return {
             'ssim_score': score,
             'bounding_boxes': bounding_boxes,
-            'total_differences': len(bounding_boxes)
+            'total_differences': len(bounding_boxes),
+            'is_entirely_different': False
         }
     except Exception as e:
         print(f"Error finding differences: {e}")
@@ -318,6 +333,10 @@ async def compare_labels(
         base_symbols_raw = run_detection_pil(base_processed)
         base_features_df = extract_all_features(raw_base_img, base_symbols_raw, logo_folder="logos")
         
+        print("\n=== Extracted Features (Base Label) ===")
+        print(base_features_df[['Type', 'Value']].to_string(index=False))
+        print("=======================================\n")
+        
         base_symbols = []
         for d in base_symbols_raw:
             d = d.copy()
@@ -337,6 +356,10 @@ async def compare_labels(
             # Run YOLO on child once and pass it down
             comp_symbols_raw = run_detection_pil(comp_aligned)
             comp_features_df = extract_all_features(comp_aligned, comp_symbols_raw, logo_folder="logos")
+            
+            print(f"\n=== Extracted Features (Child Label: {child_file.filename}) ===")
+            print(comp_features_df[['Type', 'Value']].to_string(index=False))
+            print("========================================================\n")
                 
             diff_results = find_differences(base_processed, comp_aligned, threshold=0.85, min_area=150)
             
@@ -397,8 +420,69 @@ async def compare_labels(
                     
             comp_symbols = comp_symbols_final
             
+            # --- ADVANCED FEATURE COMPARISON: BARCODES ---
+            base_bc_df = base_features_df[base_features_df['Type'] == 'Barcode']
+            comp_bc_df = comp_features_df[comp_features_df['Type'] == 'Barcode']
+            
+            added_bc = []
+            deleted_bc = []
+            modified_barcode_details = []
+            modified_barcode_boxes = [] # (base_box, comp_box)
+            
+            # Pair barcodes by proximity
+            used_base_indices = set()
+            used_comp_indices = set()
+            
+            for i, b_row in base_bc_df.iterrows():
+                b_box = b_row['Box']
+                if b_box is None: continue
+                
+                b_center = get_center(b_box)
+                best_match_idx = -1
+                min_dist = 100 # Maximum pairing distance
+                
+                for j, c_row in comp_bc_df.iterrows():
+                    if j in used_comp_indices: continue
+                    c_box = c_row['Box']
+                    if c_box is None: continue
+                    
+                    c_center = get_center(c_box)
+                    dist = math.dist(b_center, c_center)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_match_idx = j
+                
+                if best_match_idx != -1:
+                    used_base_indices.add(i)
+                    used_comp_indices.add(best_match_idx)
+                    c_row = comp_bc_df.loc[best_match_idx]
+                    
+                    if b_row['Value'] != c_row['Value']:
+                        modified_barcode_details.append(f"From: '{b_row['Value']}' ➔ To: '{c_row['Value']}'")
+                        modified_barcode_boxes.append((b_box, c_row['Box']))
+            
+            # Remaining are truly added or deleted
+            for i, b_row in base_bc_df.iterrows():
+                if i not in used_base_indices:
+                    deleted_bc.append(b_row['Value'])
+            
+            for j, c_row in comp_bc_df.iterrows():
+                if j not in used_comp_indices:
+                    added_bc.append(c_row['Value'])
+            # ---------------------------------------------
+            
             ssim_boxes = diff_results['bounding_boxes']
             text_diff_boxes = []
+            
+            def is_box_barcode(box, features_df):
+                if features_df.empty: return False
+                bc_rows = features_df[features_df['Type'] == 'Barcode']
+                for _, row in bc_rows.iterrows():
+                    bc_box = row.get("Box")
+                    if bc_box and boxes_overlap(box, bc_box, threshold=0.1):
+                        return True
+                return False
+
             for box in ssim_boxes:
                 overlap = False
                 box_coords = [box[0], box[1], box[0]+box[2], box[1]+box[3]]
@@ -406,6 +490,11 @@ async def compare_labels(
                     if boxes_overlap(box_coords, sym["bbox"]): overlap = True; break
                 for sym in comp_symbols_raw:
                     if boxes_overlap(box_coords, sym["bbox"]): overlap = True; break
+                
+                # ALSO exclude barcode regions from text diffing
+                if is_box_barcode(box_coords, base_features_df) or is_box_barcode(box_coords, comp_features_df):
+                    overlap = True
+                
                 if not overlap:
                     text_diff_boxes.append(box)
 
@@ -460,7 +549,6 @@ async def compare_labels(
                 if txt_b or txt_c:
                     modified_text.append(f"From: '{txt_b}' ➔ To: '{txt_c}'")
 
-            added_bc, deleted_bc = get_feature_diffs(base_features_df, comp_features_df, 'Barcode')
             added_img, deleted_img = get_feature_diffs(base_features_df, comp_features_df, 'Image')
 
             modified_image_details = []
@@ -494,75 +582,107 @@ async def compare_labels(
             removed_syms = [s["class"] for s in comp_symbols if s["label"] == "Removed"]
             misplaced_syms = [s["class"] for s in comp_symbols if s["label"] == "Repositioned"]
             
-            discrepancy_report = {
-                "Added": [],
-                "Deleted": [],
-                "Modified": [],
-                "Repositioned": []
-            }
-            
-            for item in added_text: discrepancy_report["Added"].append({"Category": "Text", "Value": item})
-            for item in deleted_text: discrepancy_report["Deleted"].append({"Category": "Text", "Value": item})
-            for item in modified_text: discrepancy_report["Modified"].append({"Category": "Text", "Value": item})
-            
-            for item in added_syms: discrepancy_report["Added"].append({"Category": "Symbol", "Value": item})
-            for item in misplaced_syms: discrepancy_report["Repositioned"].append({"Category": "Symbol", "Value": item})
-            for item in removed_syms: discrepancy_report["Deleted"].append({"Category": "Symbol", "Value": item})
-            
-            for item in added_bc: discrepancy_report["Added"].append({"Category": "Barcode", "Value": item})
-            for item in deleted_bc: discrepancy_report["Deleted"].append({"Category": "Barcode", "Value": item})
-            
-            for item in added_img: discrepancy_report["Added"].append({"Category": "Image", "Value": item})
-            for item in deleted_img: discrepancy_report["Deleted"].append({"Category": "Image", "Value": item})
-            for item in modified_image_details: discrepancy_report["Modified"].append({"Category": "Image", "Value": item})
+            # ---- CONSOLIDATE RESULTS ----
+            if diff_results.get('is_entirely_different'):
+                # Reset all other reports if labels are entirely different
+                discrepancy_report = {
+                    "Added": [],
+                    "Deleted": [],
+                    "Modified": [{"Category": "Label", "Value": "Significant design/content changes detected"}],
+                    "Repositioned": []
+                }
+                actual_deleted_boxes = []
+                actual_added_boxes = []
+                changed_boxes = diff_results['bounding_boxes'] # Single full box
+                base_draw_actions = [(changed_boxes[0], color_modified, "Modified", True)]
+                child_draw_actions = [(changed_boxes[0], color_modified, "Modified", True)]
+            else:
+                discrepancy_report = {
+                    "Added": [],
+                    "Deleted": [],
+                    "Modified": [],
+                    "Repositioned": []
+                }
+                
+                for item in added_text: discrepancy_report["Added"].append({"Category": "Text", "Value": item})
+                for item in deleted_text: discrepancy_report["Deleted"].append({"Category": "Text", "Value": item})
+                for item in modified_text: discrepancy_report["Modified"].append({"Category": "Text", "Value": item})
+                
+                for item in added_syms: discrepancy_report["Added"].append({"Category": "Symbol", "Value": item})
+                for item in misplaced_syms: discrepancy_report["Repositioned"].append({"Category": "Symbol", "Value": item})
+                for item in removed_syms: discrepancy_report["Deleted"].append({"Category": "Symbol", "Value": item})
+                
+                for item in added_bc: discrepancy_report["Added"].append({"Category": "Barcode", "Value": item})
+                for item in deleted_bc: discrepancy_report["Deleted"].append({"Category": "Barcode", "Value": item})
+                for item in modified_barcode_details: discrepancy_report["Modified"].append({"Category": "Barcode", "Value": item})
+                
+                for item in added_img: discrepancy_report["Added"].append({"Category": "Image", "Value": item})
+                for item in deleted_img: discrepancy_report["Deleted"].append({"Category": "Image", "Value": item})
+                for item in modified_image_details: discrepancy_report["Modified"].append({"Category": "Image", "Value": item})
+
+                # ---- DRAW BOUNDING BOXES ----
+                base_draw_actions = []
+                child_draw_actions = []
+
+                color_added = (21, 128, 61)     # Green
+                color_deleted = (222, 38, 38)   # Red
+                color_modified = (30, 61, 137)  # Dark Blue
+                color_misplaced = (245, 163, 10) # Orange
+
+                for box in actual_deleted_boxes:
+                    base_draw_actions.append((box, color_deleted, "Deleted", True))
+                for box in actual_added_boxes:
+                    child_draw_actions.append((box, color_added, "Added", True))
+                for box in changed_boxes:
+                    base_draw_actions.append((box, color_modified, "Modified", True))
+                    child_draw_actions.append((box, color_modified, "Modified", True))
+
+                for base_sym in base_symbols_raw:
+                    matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
+                    if matches:
+                        for match in matches:
+                            c1 = get_center(base_sym["bbox"])
+                            c2 = get_center(match["bbox"])
+                            dist = math.dist(c1, c2)
+                            if dist > 40: 
+                                if region_has_symbol(comp_aligned, match["bbox"]):
+                                    base_draw_actions.append((base_sym["bbox"], color_misplaced, "Repositioned", False))
+                                    child_draw_actions.append((match["bbox"], color_misplaced, "Repositioned", False))
+                    else:
+                        base_draw_actions.append((base_sym["bbox"], color_deleted, "Deleted", False))
+
+                for b_box, c_box in modified_image_boxes:
+                    base_draw_actions.append((b_box, color_modified, "Modified", False))
+                    child_draw_actions.append((c_box, color_modified, "Modified", False))
+                    
+                for box in added_img_boxes:
+                    child_draw_actions.append((box, color_added, "Added", False))
+                    
+                for box in deleted_img_boxes:
+                    base_draw_actions.append((box, color_deleted, "Deleted", False))
+
+                for b_box, c_box in modified_barcode_boxes:
+                    base_draw_actions.append((b_box, color_modified, "Modified", False))
+                    child_draw_actions.append((c_box, color_modified, "Modified", False))
+                    
+                for bc_val in added_bc:
+                    try:
+                        box = comp_features_df[(comp_features_df['Type'] == 'Barcode') & (comp_features_df['Value'] == bc_val)].iloc[0]['Box']
+                        if box: child_draw_actions.append((box, color_added, "Added", False))
+                    except: pass
+                    
+                for bc_val in deleted_bc:
+                    try:
+                        box = base_features_df[(base_features_df['Type'] == 'Barcode') & (base_features_df['Value'] == bc_val)].iloc[0]['Box']
+                        if box: base_draw_actions.append((box, color_deleted, "Deleted", False))
+                    except: pass
+
+                for d in comp_symbols_raw:
+                    if d["class"] not in [b["class"] for b in base_symbols_raw]:
+                        child_draw_actions.append((d["bbox"], color_added, "Added", False))
 
             base_features_records = base_features_df.to_dict(orient="records") if not base_features_df.empty else []
             comp_features_records = comp_features_df.to_dict(orient="records") if not comp_features_df.empty else []
-
-            # ---- DRAW BOUNDING BOXES ----
-            base_draw_actions = []
-            child_draw_actions = []
-
-            color_added = (21, 128, 61)     # Green
-            color_deleted = (222, 38, 38)   # Red
-            color_modified = (30, 61, 137)  # Dark Blue
-            color_misplaced = (245, 163, 10) # Orange
-
-            for box in actual_deleted_boxes:
-                base_draw_actions.append((box, color_deleted, "Deleted", True))
-            for box in actual_added_boxes:
-                child_draw_actions.append((box, color_added, "Added", True))
-            for box in changed_boxes:
-                base_draw_actions.append((box, color_modified, "Modified", True))
-                child_draw_actions.append((box, color_modified, "Modified", True))
-
-            for base_sym in base_symbols_raw:
-                matches = [c for c in comp_symbols_raw if c["class"] == base_sym["class"]]
-                if matches:
-                    for match in matches:
-                        c1 = get_center(base_sym["bbox"])
-                        c2 = get_center(match["bbox"])
-                        dist = math.dist(c1, c2)
-                        if dist > 40: 
-                            if region_has_symbol(comp_aligned, match["bbox"]):
-                                base_draw_actions.append((base_sym["bbox"], color_misplaced, "Repositioned", False))
-                                child_draw_actions.append((match["bbox"], color_misplaced, "Repositioned", False))
-                else:
-                    base_draw_actions.append((base_sym["bbox"], color_deleted, "Deleted", False))
-
-            for b_box, c_box in modified_image_boxes:
-                base_draw_actions.append((b_box, color_modified, "Modified", False))
-                child_draw_actions.append((c_box, color_modified, "Modified", False))
-                
-            for box in added_img_boxes + added_bc_boxes:
-                child_draw_actions.append((box, color_added, "Added", False))
-                
-            for box in deleted_img_boxes + deleted_bc_boxes:
-                base_draw_actions.append((box, color_deleted, "Deleted", False))
-
-            for d in comp_symbols_raw:
-                if d["class"] not in [b["class"] for b in base_symbols_raw]:
-                    child_draw_actions.append((d["bbox"], color_added, "Added", False))
 
             base_img_out = base_processed.copy()
             child_img_out = comp_aligned.copy()
